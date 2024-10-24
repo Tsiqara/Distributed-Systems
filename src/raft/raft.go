@@ -235,7 +235,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	if args.Term >= rf.currentTerm {
 		DPrintf("server %v accept appendEntries from %v", rf.me, args.LeaderId)
 		reply.Term = rf.currentTerm
 		reply.Success = true
@@ -244,13 +244,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.lastHeartBeatTime = time.Now()
 		rf.mu.Unlock()
-	} else if args.Term == rf.currentTerm {
-		DPrintf("server %v accept appendEntries from %v", rf.me, args.LeaderId)
-		reply.Term = rf.currentTerm
-		reply.Success = true
-		rf.lastHeartBeatTime = time.Now()
-		rf.mu.Unlock()
 	}
+	//} else if args.Term == rf.currentTerm {
+	//	DPrintf("server %v accept appendEntries from %v", rf.me, args.LeaderId)
+	//	reply.Term = rf.currentTerm
+	//	reply.Success = true
+	//	rf.lastHeartBeatTime = time.Now()
+	//	rf.mu.Unlock()
+	//}
 
 }
 
