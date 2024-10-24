@@ -183,6 +183,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = "follower"
+		rf.votesNum = 0
 		rf.votedFor = -1
 		DPrintf("server %v's term %v is less then args' %v converted to follower", rf.me, rf.currentTerm, args.Term)
 	}
@@ -239,6 +240,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		reply.Success = true
 		rf.state = "follower"
+		rf.votesNum = 0
 		rf.currentTerm = args.Term
 		rf.lastHeartBeatTime = time.Now()
 		rf.mu.Unlock()
@@ -377,7 +379,7 @@ func (rf *Raft) sendHeartBeats() {
 			rf.mu.Unlock()
 		}
 		if rf.killed() {
-			rf.mu.Unlock()
+			//rf.mu.Unlock()
 			return
 		}
 
@@ -387,15 +389,25 @@ func (rf *Raft) sendHeartBeats() {
 
 		//rf.mu.Unlock()
 		go func(server int) {
-			hbReply := AppendEntriesReply{}
-			DPrintf("server %v send appendEntries to peer %v", rf.me, server)
-			ok := rf.peers[server].Call("Raft.AppendEntries", &hbArgs, &hbReply)
 			rf.mu.Lock()
-			if ok && hbReply.Term > rf.currentTerm {
-				rf.currentTerm = hbReply.Term
+			if rf.state == "leader" && rf.currentTerm == hbArgs.Term {
+				rf.mu.Unlock()
+				hbReply := AppendEntriesReply{}
+				DPrintf("server %v send appendEntries to peer %v", rf.me, server)
+				ok := rf.peers[server].Call("Raft.AppendEntries", &hbArgs, &hbReply)
+				rf.mu.Lock()
+				if ok && hbReply.Term > rf.currentTerm {
+					rf.currentTerm = hbReply.Term
+					rf.state = "follower"
+					rf.votesNum = 0
+				}
+				rf.mu.Unlock()
+			} else {
+				DPrintf("Server %v is no longer leader", rf.me)
 				rf.state = "follower"
+				rf.votesNum = 0
+				rf.mu.Unlock()
 			}
-			rf.mu.Unlock()
 		}(i)
 
 	}
@@ -427,13 +439,13 @@ func (rf *Raft) startElection() {
 		}
 
 		if rf.killed() {
-			rf.mu.Unlock()
+			//rf.mu.Unlock()
 			return
 		}
 
 		go func(server int) {
 			rf.mu.Lock()
-			if rf.state == "candidate" {
+			if rf.state == "candidate" && rf.currentTerm == voteArgs.Term {
 				rf.mu.Unlock()
 				voteReply := RequestVoteReply{}
 				ok := rf.sendRequestVote(server, &voteArgs, &voteReply)
@@ -444,21 +456,23 @@ func (rf *Raft) startElection() {
 						if rf.votesNum > len(rf.peers)/2 {
 							DPrintf("server %v won the election for term %v with %v votes prematurely", rf.me, rf.currentTerm, rf.votesNum)
 							rf.mu.Unlock()
-							rf.becomeLeader()
+							go rf.becomeLeader()
 							return
 						}
 					} else if voteReply.Term > rf.currentTerm {
 						rf.currentTerm = voteReply.Term
 						rf.state = "follower"
+						rf.votesNum = 0
 					}
 					rf.mu.Unlock()
 				}
 			} else {
 				DPrintf("Server %v is no longer candidate", rf.me)
+				rf.state = "follower"
+				rf.votesNum = 0
 				rf.mu.Unlock()
 			}
 		}(i)
-
 	}
 }
 
@@ -466,7 +480,7 @@ func (rf *Raft) becomeLeader() {
 	rf.mu.Lock()
 	rf.state = "leader"
 	rf.mu.Unlock()
-	go rf.sendHeartBeats()
+	rf.sendHeartBeats()
 }
 
 // the service or tester wants to create a Raft server. the ports
