@@ -196,6 +196,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= len(rf.log)) {
 			reply.VoteGranted = true
+			rf.lastHeartBeatTime = time.Now()
 			reply.Term = rf.currentTerm
 			rf.votedFor = args.CandidateId
 			DPrintf("server %v vote for %v is %v ", rf.me, args.CandidateId, reply.VoteGranted)
@@ -338,7 +339,7 @@ func (rf *Raft) ticker() {
 		if rf.state == "leader" {
 			DPrintf("leader %v heartbeatTicker tick", rf.me)
 			rf.mu.Unlock()
-			go rf.sendHeartBeats()
+			//go rf.sendHeartBeats()
 		} else if rf.state == "follower" {
 			rf.votesNum = 0
 			if time.Now().Sub(rf.lastHeartBeatTime).Milliseconds() > (minHeartBeatTimeout + rand.Int63()%HeartBeatTimeoutRange) {
@@ -369,6 +370,35 @@ func (rf *Raft) ticker() {
 	}
 }
 
+func (rf *Raft) heartBeat() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		DPrintf("avige lock tick heart")
+		if rf.state == "leader" {
+			rf.mu.Unlock()
+			DPrintf("davde lock tick hb l")
+			for {
+				rf.mu.Lock()
+				DPrintf("avige lock tick heart for")
+				if rf.state != "leader" {
+					rf.mu.Unlock()
+					DPrintf("davde lock tick hb not l")
+					break
+				}
+				rf.mu.Unlock()
+				DPrintf("davde lock tick hb before go")
+				go rf.sendHeartBeats()
+				time.Sleep(time.Duration(100) * time.Millisecond)
+			}
+		} else {
+			rf.mu.Unlock()
+			DPrintf("davde lock tick hb lelse")
+			ms := 10
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+	}
+}
+
 func (rf *Raft) sendHeartBeats() {
 	rf.mu.Lock()
 	hbArgs := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me}
@@ -387,6 +417,8 @@ func (rf *Raft) sendHeartBeats() {
 		if i == rf.me {
 			continue
 		}
+
+		// todo yvelas tavisi args
 
 		//rf.mu.Unlock()
 		go func(server int) {
@@ -481,7 +513,7 @@ func (rf *Raft) becomeLeader() {
 	rf.mu.Lock()
 	rf.state = "leader"
 	rf.mu.Unlock()
-	rf.sendHeartBeats()
+	//rf.sendHeartBeats()
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -518,6 +550,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	go rf.heartBeat()
 
 	return rf
 }
