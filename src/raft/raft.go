@@ -230,7 +230,7 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm || rf.killed() {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		DPrintf("server %v refuse appendEntries from %v", rf.me, args.LeaderId)
@@ -258,9 +258,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return
 		}
 
-		if args.PrevLogIndex > 0 && (len(rf.log) < args.PrevLogIndex || rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+		if args.PrevLogIndex >= 0 && (len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 			reply.Success = false
 			reply.Term = rf.currentTerm
+			DPrintf("[server %v] log %v, prevLogIndex %v", rf.me, rf.log, args.PrevLogIndex)
+			if len(rf.log) > args.PrevLogIndex {
+				DPrintf("my term %v, leader term %v", rf.log[args.PrevLogIndex-1].Term, args.PrevLogTerm)
+			}
 			DPrintf("[server %v] doesn’t contain an entry at prevLogIndex\nwhose term matches prevLogTerm of %v",
 				rf.me, args.LeaderId)
 			rf.mu.Unlock()
@@ -475,12 +479,13 @@ func (rf *Raft) sendHeartBeats() {
 				Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: 0, PrevLogTerm: 0, LeaderCommit: rf.commitIndex,
 			}
 
-			if rf.nextIndex[server] > 0 && len(rf.log)-1 >= rf.nextIndex[server] {
+			if rf.nextIndex[server] >= 0 && len(rf.log) >= rf.nextIndex[server] {
 				entries := make([]LogEntry, len(rf.log)-rf.nextIndex[server])
 				copy(entries, rf.log[rf.nextIndex[server]:])
 				hbArgs.Entries = entries
+				DPrintf("[server %v] send entries %v to server %v matchind %v nextIndex %v", rf.me, entries, server, rf.matchIndex, rf.nextIndex)
 				hbArgs.PrevLogIndex = rf.nextIndex[server] - 1
-				if hbArgs.PrevLogIndex > 0 {
+				if hbArgs.PrevLogIndex >= 0 {
 					hbArgs.PrevLogTerm = rf.log[hbArgs.PrevLogIndex].Term
 				}
 			}
@@ -499,7 +504,11 @@ func (rf *Raft) sendHeartBeats() {
 				}
 				if !hbReply.Success && hbReply.Term <= rf.currentTerm {
 					DPrintf("Server %v failed, append decrement nextIndex for %v", rf.me, server)
-					rf.nextIndex[server]--
+					if rf.nextIndex[server] > 0 {
+						rf.nextIndex[server]--
+					}
+					rf.mu.Unlock()
+					return
 				}
 				if hbReply.Success && len(hbArgs.Entries) > 0 {
 					DPrintf("Server %v success append entries for %v", rf.me, server)
@@ -642,11 +651,12 @@ func (rf *Raft) becomeLeader() {
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = len(rf.log)
-		rf.matchIndex[i] = 0
+		rf.nextIndex[i] = len(rf.log) - 1
+		rf.matchIndex[i] = 1
 	}
 
 	rf.matchIndex[rf.me] = len(rf.log) - 1
+	DPrintf("[server %v] became leader nextInd %v matchInd %v", rf.me, rf.nextIndex, rf.matchIndex)
 	rf.mu.Unlock()
 	//rf.sendHeartBeats()
 }
