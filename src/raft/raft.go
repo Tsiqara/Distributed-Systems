@@ -277,7 +277,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 		rf.state = "follower"
 		rf.votesNum = 0
-		rf.votedFor = -1
+		if args.Term > rf.currentTerm {
+			rf.votedFor = -1
+		}
 		rf.currentTerm = args.Term
 		rf.persist()
 		rf.lastHeartBeatTime = time.Now()
@@ -297,7 +299,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.PrevLogIndex >= 0 && (len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 			reply.Success = false
 			reply.Term = rf.currentTerm
-			reply.XLen = len(rf.log) - 1
+			reply.XLen = len(rf.log)
 			reply.XTerm = -1
 			reply.XIndex = -1
 			if len(rf.log) > args.PrevLogIndex {
@@ -460,8 +462,6 @@ func (rf *Raft) ticker() {
 			//go rf.sendAppendEntries()
 		} else if rf.state == "follower" {
 			rf.votesNum = 0
-			rf.votedFor = -1
-			rf.persist()
 			if time.Now().Sub(rf.lastHeartBeatTime).Milliseconds() > (minHeartBeatTimeout + rand.Int63()%HeartBeatTimeoutRange) {
 				rf.mu.Unlock()
 				go rf.startElection()
