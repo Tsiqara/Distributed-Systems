@@ -177,6 +177,7 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	//DPrintf("server %v received snapshot index %v log %v", rf.me, index, rf.log)
 	//rf.mu.Lock()
 	//
 	//if index < rf.log[0].Index || index > rf.log[len(rf.log)-1].Index {
@@ -193,6 +194,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	//	rf.lastIncludedTerm = rf.log[0].Term
 	//}
 	//rf.persist(snapshot)
+	//DPrintf("server %v log %v", rf.me, rf.log)
 	//rf.mu.Unlock()
 }
 
@@ -233,11 +235,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	rf.lastHeartBeatTime = time.Now()
 	lastIndex := -1
+	lastIncludedTerm := 0
 	if len(rf.log) > 0 {
 		lastIndex = rf.log[len(rf.log)-1].Index
+		lastIncludedTerm = rf.log[len(rf.log)-1].Term
 	}
 
-	lastIncludedTerm := rf.log[args.LastIncludedIndex-rf.lastIncludedIndex].Term
 	if lastIndex >= args.LastIncludedIndex && lastIncludedTerm == args.LastIncludedTerm {
 		rf.log = rf.log[args.LastIncludedIndex-rf.lastIncludedIndex:]
 	} else {
@@ -616,6 +619,32 @@ func (rf *Raft) sendAppendEntries() {
 				Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: -1, PrevLogTerm: -1, LeaderCommit: rf.commitIndex,
 			}
 
+			if rf.nextIndex[server] <= rf.lastIncludedIndex && rf.lastIncludedTerm > 0 {
+				snapArgs := InstallSnapshotArgs{
+					Term: rf.currentTerm, LeaderId: rf.me, LastIncludedIndex: rf.lastIncludedIndex, LastIncludedTerm: rf.lastIncludedTerm,
+					Data: rf.snapshot,
+				}
+
+				if rf.state == "leader" && rf.currentTerm == snapArgs.Term {
+					rf.mu.Unlock()
+					snapReply := InstallSnapshotReply{}
+					DPrintf("server %v send install snapshot %v to peer %v", rf.me, snapArgs.Data, server)
+					ok := rf.peers[server].Call("Raft.InstallSnapshot", &snapArgs, &snapReply)
+					rf.mu.Lock()
+					if ok && snapReply.Term > rf.currentTerm {
+						DPrintf("Server %v incorrect term is no longer leader", rf.me)
+						rf.currentTerm = snapReply.Term
+						rf.votedFor = -1
+						rf.persist(nil)
+						rf.state = "follower"
+						rf.votesNum = 0
+					}
+					rf.commitIndex = max(rf.commitIndex, rf.lastIncludedIndex)
+				}
+				rf.mu.Unlock()
+				return
+			}
+
 			if rf.nextIndex[server]-rf.lastIncludedIndex >= 0 && len(rf.log) >= rf.nextIndex[server]-rf.lastIncludedIndex {
 				entries := make([]LogEntry, len(rf.log)-rf.nextIndex[server]+rf.lastIncludedIndex)
 				copy(entries, rf.log[rf.nextIndex[server]-rf.lastIncludedIndex:])
@@ -737,10 +766,26 @@ func (rf *Raft) updateCommitIndex() {
 func (rf *Raft) apply() {
 	for rf.killed() == false {
 		rf.mu.Lock()
+		if rf.snapshot != nil && rf.lastApplied <= rf.lastIncludedIndex && rf.lastIncludedIndex > 0 {
+			//lastIncInd := rf.lastIncludedIndex
+			rf.mu.Unlock()
+			msg := ApplyMsg{
+				CommandValid:  false,
+				SnapshotValid: true,
+				Snapshot:      rf.snapshot,
+				SnapshotIndex: rf.lastIncludedIndex,
+				SnapshotTerm:  rf.lastIncludedTerm,
+			}
+			rf.applyCh <- msg
+			rf.mu.Lock()
+			rf.lastApplied = rf.lastIncludedIndex - 1
+			//rf.mu.Unlock()
+		}
+
 		if rf.commitIndex > rf.lastApplied && rf.commitIndex <= len(rf.log)-1+rf.lastIncludedIndex && len(rf.log) > 0 {
 			DPrintf("server %v commitInd %v  appliedInd %v log %v", rf.me, rf.commitIndex, rf.lastApplied, rf.log)
 			entry := make([]LogEntry, rf.commitIndex-rf.lastApplied)
-			copy(entry, rf.log[rf.lastApplied+1-rf.lastIncludedIndex:rf.commitIndex+1-rf.lastIncludedIndex])
+			copy(entry, rf.log[max(0, rf.lastApplied+1-rf.lastIncludedIndex):rf.commitIndex+1-rf.lastIncludedIndex])
 			appInd := rf.lastApplied
 			oldCommitInd := rf.commitIndex
 			rf.mu.Unlock()
