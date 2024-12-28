@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
@@ -18,11 +19,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type      string
+	Key       string
+	Value     string
+	RequestID int
+	ClientID  int64
 }
 
 type KVServer struct {
@@ -35,19 +40,176 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	kvMap                   map[string]string
+	clientDoneRequestNumMap map[int64]int
+	clientRequestValueMap   map[int64]string
+
+	appliedOps []Op
 }
 
+func (kv *KVServer) Contains(targetOp Op) bool {
+	for _, op := range kv.appliedOps {
+		if op == targetOp {
+			return true
+		}
+	}
+	return false
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	kv.mu.Lock()
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	if args.RequestID < kv.clientDoneRequestNumMap[args.ClientID] {
+		reply.Err = OK
+		reply.Value = kv.kvMap[args.Key]
+		kv.mu.Unlock()
+		return
+	}
+
+	kv.mu.Unlock()
+	op := Op{
+		Type:      "Get",
+		Key:       args.Key,
+		Value:     "",
+		RequestID: args.RequestID,
+		ClientID:  args.ClientID,
+	}
+
+	err := kv.attemptCommitOp(op)
+	kv.mu.Lock()
+	if err == OK {
+		reply.Value = kv.kvMap[args.Key]
+	}
+	reply.Err = err
+	kv.mu.Unlock()
+
+	//if err == OK {
+	//DPrintf("[server %v] kvmap %v, clientDoneRequestNumMap %v, clientRequestValueMap %v", kv.me, kv.kvMap, kv.clientDoneRequestNumMap, kv.clientRequestValueMap)
+	//}
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	if args.RequestID < kv.clientDoneRequestNumMap[args.ClientID] {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+
+	kv.mu.Unlock()
+	op := Op{
+		Type:      args.Type,
+		Key:       args.Key,
+		Value:     args.Value,
+		RequestID: args.RequestID,
+		ClientID:  args.ClientID,
+	}
+
+	err := kv.attemptCommitOp(op)
+	reply.Err = err
+	//if err == OK {
+	//DPrintf("[server %v] kvmap %v, clientDoneRequestNumMap %v, clientRequestValueMap %v", kv.me, kv.kvMap, kv.clientDoneRequestNumMap, kv.clientRequestValueMap)
+	//}
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	if args.RequestID < kv.clientDoneRequestNumMap[args.ClientID] {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+
+	kv.mu.Unlock()
+	op := Op{
+		Type:      args.Type,
+		Key:       args.Key,
+		Value:     args.Value,
+		RequestID: args.RequestID,
+		ClientID:  args.ClientID,
+	}
+
+	err := kv.attemptCommitOp(op)
+	reply.Err = err
+
+	//DPrintf("Append %v reply %v err %v", args, reply, err)
+	//if err == OK {
+	//	DPrintf("[server %v] kvmap %v, clientDoneRequestNumMap %v, clientRequestValueMap %v", kv.me, kv.kvMap, kv.clientDoneRequestNumMap, kv.clientRequestValueMap)
+	//}
+}
+
+func (kv *KVServer) attemptCommitOp(op Op) Err {
+	_, term, _ := kv.rf.Start(op)
+
+	for {
+		kv.mu.Lock()
+		if kv.killed() {
+			kv.mu.Unlock()
+			return ErrWrongLeader
+		}
+
+		currTerm, isLeader := kv.rf.GetState()
+		if !isLeader || term != currTerm {
+			kv.mu.Unlock()
+			return ErrWrongLeader
+		}
+
+		if op.RequestID == kv.clientDoneRequestNumMap[op.ClientID] {
+			kv.mu.Unlock()
+			break
+		}
+
+		kv.mu.Unlock()
+		time.Sleep(1 * time.Millisecond)
+	}
+	return OK
+}
+
+func (kv *KVServer) checkCommits() {
+	for kv.killed() == false {
+		appliedMsg := <-kv.applyCh
+
+		commitedOp := appliedMsg.Command.(Op)
+		if !kv.Contains(commitedOp) {
+			kv.appliedOps = append(kv.appliedOps, commitedOp)
+
+			DPrintf("[server %v] appliedMsg %v commitedOp %v", kv.me, appliedMsg, commitedOp)
+
+			kv.mu.Lock()
+			kv.clientDoneRequestNumMap[commitedOp.ClientID] = commitedOp.RequestID
+			kv.clientRequestValueMap[commitedOp.ClientID] = commitedOp.Value
+
+			if commitedOp.Type == "Put" {
+				kv.kvMap[commitedOp.Key] = commitedOp.Value
+			} else if commitedOp.Type == "Append" {
+				kv.kvMap[commitedOp.Key] = kv.kvMap[commitedOp.Key] + commitedOp.Value
+			}
+			kv.mu.Unlock()
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -96,6 +258,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.kvMap = make(map[string]string)
+	kv.clientDoneRequestNumMap = make(map[int64]int)
+	kv.clientRequestValueMap = make(map[int64]string)
+	kv.appliedOps = make([]Op, 0)
+
+	go kv.checkCommits()
 
 	return kv
 }
