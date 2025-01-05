@@ -4,6 +4,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -40,21 +41,23 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister *raft.Persister
+
 	kvMap                   map[string]string
 	clientDoneRequestNumMap map[int64]int
-	clientRequestValueMap   map[int64]string
+	//clientRequestValueMap   map[int64]string
 
-	appliedOps []Op
+	//appliedOps []Op
 }
 
-func (kv *KVServer) Contains(targetOp Op) bool {
-	for _, op := range kv.appliedOps {
-		if op == targetOp {
-			return true
-		}
-	}
-	return false
-}
+//func (kv *KVServer) Contains(targetOp Op) bool {
+//	for _, op := range kv.appliedOps {
+//		if op == targetOp {
+//			return true
+//		}
+//	}
+//	return false
+//}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
@@ -65,7 +68,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	if args.RequestID < kv.clientDoneRequestNumMap[args.ClientID] {
+	if args.RequestID <= kv.clientDoneRequestNumMap[args.ClientID] {
 		reply.Err = OK
 		reply.Value = kv.kvMap[args.Key]
 		kv.mu.Unlock()
@@ -104,7 +107,7 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	if args.RequestID < kv.clientDoneRequestNumMap[args.ClientID] {
+	if args.RequestID <= kv.clientDoneRequestNumMap[args.ClientID] {
 		reply.Err = OK
 		kv.mu.Unlock()
 		return
@@ -136,7 +139,7 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	if args.RequestID < kv.clientDoneRequestNumMap[args.ClientID] {
+	if args.RequestID <= kv.clientDoneRequestNumMap[args.ClientID] {
 		reply.Err = OK
 		kv.mu.Unlock()
 		return
@@ -163,9 +166,11 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) attemptCommitOp(op Op) Err {
 	_, term, _ := kv.rf.Start(op)
 
+	startTime := time.Now()
+
 	for {
 		kv.mu.Lock()
-		if kv.killed() {
+		if kv.killed() || time.Now().Sub(startTime) > 1*time.Second {
 			kv.mu.Unlock()
 			return ErrWrongLeader
 		}
@@ -176,7 +181,7 @@ func (kv *KVServer) attemptCommitOp(op Op) Err {
 			return ErrWrongLeader
 		}
 
-		if op.RequestID == kv.clientDoneRequestNumMap[op.ClientID] {
+		if op.RequestID <= kv.clientDoneRequestNumMap[op.ClientID] {
 			kv.mu.Unlock()
 			break
 		}
@@ -191,25 +196,89 @@ func (kv *KVServer) checkCommits() {
 	for kv.killed() == false {
 		appliedMsg := <-kv.applyCh
 
-		commitedOp := appliedMsg.Command.(Op)
-		if !kv.Contains(commitedOp) {
-			kv.appliedOps = append(kv.appliedOps, commitedOp)
+		DPrintf("[server %v] mivige message %v", kv.me, appliedMsg)
 
-			DPrintf("[server %v] appliedMsg %v commitedOp %v", kv.me, appliedMsg, commitedOp)
+		if appliedMsg.CommandValid {
+			commitedOp := appliedMsg.Command.(Op)
 
 			kv.mu.Lock()
-			kv.clientDoneRequestNumMap[commitedOp.ClientID] = commitedOp.RequestID
-			kv.clientRequestValueMap[commitedOp.ClientID] = commitedOp.Value
+			requestID, ok := kv.clientDoneRequestNumMap[commitedOp.ClientID]
+			if !ok || requestID < commitedOp.RequestID {
+				//if !kv.Contains(commitedOp) {
+				//kv.appliedOps = append(kv.appliedOps, commitedOp)
 
-			if commitedOp.Type == "Put" {
-				kv.kvMap[commitedOp.Key] = commitedOp.Value
-			} else if commitedOp.Type == "Append" {
-				kv.kvMap[commitedOp.Key] = kv.kvMap[commitedOp.Key] + commitedOp.Value
+				DPrintf("[server %v] appliedMsg %v commitedOp %v", kv.me, appliedMsg, commitedOp)
+
+				kv.clientDoneRequestNumMap[commitedOp.ClientID] = commitedOp.RequestID
+				//kv.clientRequestValueMap[commitedOp.ClientID] = commitedOp.Value
+
+				if commitedOp.Type == "Put" {
+					kv.kvMap[commitedOp.Key] = commitedOp.Value
+				} else if commitedOp.Type == "Append" {
+					kv.kvMap[commitedOp.Key] = kv.kvMap[commitedOp.Key] + commitedOp.Value
+				}
+
 			}
 			kv.mu.Unlock()
+
+			kv.controlRaftStateSize(appliedMsg.CommandIndex)
+
+		} else if appliedMsg.SnapshotValid {
+			kv.readFromSnapshot(appliedMsg.Snapshot)
+			DPrintf("[server %v] wavikitxeee", kv.me)
 		}
+
 		time.Sleep(1 * time.Millisecond)
+		DPrintf("[server %v] gavigvidzeee", kv.me)
 	}
+}
+
+func (kv *KVServer) readFromSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var kvMap map[string]string
+	var clientDoneRequestNumMap map[int64]int
+
+	if d.Decode(&kvMap) != nil || d.Decode(&clientDoneRequestNumMap) != nil {
+		panic("Error decoding persisted state")
+	} else {
+		//kv.mu.Lock()
+
+		DPrintf("[server %v] readFromSnapshot", kv.me)
+		kv.kvMap = kvMap
+		kv.clientDoneRequestNumMap = clientDoneRequestNumMap
+		DPrintf("[server %v] readFromSnapshot kvMap %v clientDoneRequestNumMap %v", kv.me, kv.kvMap, kv.clientDoneRequestNumMap)
+
+		//kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) controlRaftStateSize(index int) {
+	//for kv.killed() == false {
+	kv.mu.Lock()
+	DPrintf("[server %v] controlRaftStateSize index=%v size %v, maxSize %v", kv.me, index, kv.persister.RaftStateSize(), kv.maxraftstate)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(kv.kvMap)
+	e.Encode(kv.clientDoneRequestNumMap)
+
+	state := w.Bytes()
+
+	if kv.maxraftstate > 0 && kv.persister.RaftStateSize() >= kv.maxraftstate-len(state) {
+		kv.rf.Snapshot(index, state)
+	}
+	kv.mu.Unlock()
+
+	//	time.Sleep(1 * time.Millisecond)
+	//}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -252,6 +321,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
+	kv.persister = persister
+
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -260,10 +331,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.kvMap = make(map[string]string)
 	kv.clientDoneRequestNumMap = make(map[int64]int)
-	kv.clientRequestValueMap = make(map[int64]string)
-	kv.appliedOps = make([]Op, 0)
+	//kv.clientRequestValueMap = make(map[int64]string)
+	//kv.appliedOps = make([]Op, 0)
+
+	kv.readFromSnapshot(persister.ReadSnapshot())
 
 	go kv.checkCommits()
-
+	//go kv.controlRaftStateSize()
 	return kv
 }
